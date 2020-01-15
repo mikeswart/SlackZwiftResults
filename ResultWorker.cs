@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Logging;
@@ -22,19 +23,19 @@ namespace Dropouts.ZwiftResults
 
             string eventId = request.text;
 
-            string resultsJson = string.Empty;
-            using (var client = new HttpClient())
-            {
-                var resultsUrl = $"https://zwiftpower.com/api3.php?do=event_results&zid={eventId}";
-                log.LogInformation($"Querying Zwiftpower for results: {resultsUrl}");
-                resultsJson = client.GetStringAsync(resultsUrl).Result;
-            }
+            var titleTask = GetRideTitleAsync(eventId);
+            var resultsTask = GetResultsDataAsync(log, eventId);
+
+            Task.WaitAll(titleTask, resultsTask);
+
+            var resultsJson = await resultsTask;
+            var title = await titleTask;
 
             log.LogInformation($"Received Result - Parsing Data. Result looks like: {resultsJson.Take(20)}");
             dynamic results = JsonConvert.DeserializeObject(resultsJson);
 
             log.LogInformation("Building Slack Response String");
-            var slackResponseString = CreateSlackResponseString(results);
+            var slackResponseString = CreateSlackResponseString(title, results);
 
             using (var client = new HttpClient())
             {
@@ -51,10 +52,21 @@ namespace Dropouts.ZwiftResults
             }
         }
 
-        private static string CreateSlackResponseString(dynamic results)
+        private static async Task<string> GetResultsDataAsync(ILogger log, string eventId)
+        {
+            using (var client = new HttpClient())
+            {
+                var resultsUrl = $"https://zwiftpower.com/api3.php?do=event_results&zid={eventId}";
+                log.LogInformation($"Querying Zwiftpower for results: {resultsUrl}");
+                return await client.GetStringAsync(resultsUrl);
+            }
+        }
+
+        private static string CreateSlackResponseString(string title, dynamic results)
         {
             var teamResults = ((IEnumerable<dynamic>)results.data).Where(result => result.tname == DropoutsTeamName);
             var resultMessage = new StringBuilder();
+            resultMessage.AppendLine(title);
             resultMessage.AppendLine("Results for Dropouts:");
 
             foreach (var categoryGrouping in teamResults.GroupBy(result => result.category))
@@ -67,6 +79,23 @@ namespace Dropouts.ZwiftResults
             }
 
             return resultMessage.ToString();
+        }
+
+        private static async Task<string> GetRideTitleAsync(string eventId)
+        {
+            using(var httpClient = new HttpClient())
+            {
+                var sourceUrl = $"https://zwiftpower.com/events.php?zid={eventId}";
+                var source = await httpClient.GetStringAsync(sourceUrl);
+
+                Match match = Regex.Match(source, @"\<title\b[^>]*\>\s*(?<Title>[\s\S]*?)\</title\>", RegexOptions.IgnoreCase);
+                if(match != null && match.Success)
+                {
+                    return match.Groups["Title"].Value;
+                }
+
+                return "Unknown EventId";
+            }
         }
     }
 }
