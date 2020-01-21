@@ -12,7 +12,6 @@ namespace Dropouts.ZwiftResults
 {
     public static class ResultWorker
     {
-        private const string DropoutsTeamName = "&#9888;&#65039; Dropouts";
 
         [FunctionName("ResultWorker")]
         public static async Task Run([QueueTrigger("zwiftresultrequests", Connection = "zwiftresultsstorage_STORAGE")]string myQueueItem, ILogger log)
@@ -23,10 +22,67 @@ namespace Dropouts.ZwiftResults
 
             string eventId = request.text;
 
-            var titleTask = GetRideTitleAsync(eventId);
-            var resultsTask = GetResultsDataAsync(log, eventId);
+            CommandParser.TryParse(
+                (string)request.text,
+                (CommandNames.Event, async parameters => await DoEvent(parameters, request, log)),
+                (CommandNames.Team, async parameters => await DoTeam(parameters, request,log)));
+        }
 
-            Task.WaitAll(titleTask, resultsTask);
+        private static async Task DoTeam(string[] parameters, dynamic request, ILogger log)
+        {
+            string jsonResult = string.Empty;
+            using(var httpClient = new HttpClient())
+            {
+                var sourceUrl = $"https://zwiftpower.com/api3.php?do=team_results&id={ZwiftPowerConstants.DropoutsTeamId}";
+                jsonResult = await httpClient.GetStringAsync(sourceUrl);
+            }
+
+
+            var lastEventCount = 1;
+            if(parameters.Length > 0)
+            {
+                if(int.TryParse(parameters[0], out var userDefinedEventCount))
+                {
+                    lastEventCount = userDefinedEventCount;
+                }
+            }
+
+            dynamic results = JsonConvert.DeserializeObject(jsonResult);
+
+            var resultMessage = new StringBuilder();
+            resultMessage.AppendLine(":warning: Dropout Team Results");
+            resultMessage.AppendLine($"Results for the last {lastEventCount} event(s)");
+
+            string json = results.events.ToString();
+            var dictionary = JsonConvert.DeserializeObject<Dictionary<string, dynamic>>(json);
+
+            foreach(dynamic zwiftEvent in dictionary.Values.TakeLast(lastEventCount))
+            {
+                var eventResults = GetEventResults((string)zwiftEvent.zid);
+                resultMessage.AppendLine($"{zwiftEvent.title} - http://zwiftpower.com/events/{zwiftEvent.zid}");
+                resultMessage.Append(CreateSlackResponseString(eventResults));
+            }
+
+            PostMessage(request, resultMessage.ToString(), log, false);
+
+            dynamic GetEventResults(string eventId)
+            {
+                return ((IEnumerable<dynamic>)results.data).Where(result => string.Equals((string)result.zid, eventId));
+            }
+        }
+
+        private static async Task DoEvent(string[] parameters, dynamic request, ILogger log)
+        {
+            if(!int.TryParse(parameters.First(), out var eventId))
+            {
+                await PostMessage(request.response_url, "Invalid event id!", log, true);
+                return;
+            }
+
+            var titleTask = GetRideTitleAsync(eventId.ToString());
+            var resultsTask = GetResultsDataAsync(log, eventId.ToString());
+
+            await Task.WhenAll(titleTask, resultsTask);
 
             var resultsJson = await resultsTask;
             var title = await titleTask;
@@ -35,19 +91,30 @@ namespace Dropouts.ZwiftResults
             dynamic results = JsonConvert.DeserializeObject(resultsJson);
 
             log.LogInformation("Building Slack Response String");
-            var slackResponseString = CreateSlackResponseString(title, results);
 
+            var teamResults = ((IEnumerable<dynamic>)results.data).Where(result => result.tname == ZwiftPowerConstants.DropoutsTeamName);
+            var resultMessage = new StringBuilder();
+            resultMessage.AppendLine(title);
+            resultMessage.AppendLine("Results for Dropouts:");
+            resultMessage.Append(CreateSlackResponseString(teamResults));
+
+            await PostMessage(request, resultMessage.ToString(), log, false);
+        }
+
+        private static async Task PostMessage(dynamic requestMessage, string message, ILogger log, bool ephemeral)
+        {
             using (var client = new HttpClient())
             {
-                log.LogInformation($"Posting response string to {(string)request.response_url}");
+                var requestUri = (string)requestMessage.response_url;
+                log.LogInformation($"Posting response string to {requestUri}");
                 await client.PostAsync(
-                    (string)request.response_url,
+                    requestUri,
                     new StringContent(
                         JsonConvert.SerializeObject(new
                         {
                             replace_original = true,
-                            response_type = "in_channel",
-                            text = slackResponseString
+                            response_type = ephemeral ? "ephemeral" : "in_channel",
+                            text = message
                         })));
             }
         }
@@ -62,13 +129,9 @@ namespace Dropouts.ZwiftResults
             }
         }
 
-        private static string CreateSlackResponseString(string title, dynamic results)
+        private static string CreateSlackResponseString(IEnumerable<dynamic> teamResults)
         {
-            var teamResults = ((IEnumerable<dynamic>)results.data).Where(result => result.tname == DropoutsTeamName);
-            var resultMessage = new StringBuilder();
-            resultMessage.AppendLine(title);
-            resultMessage.AppendLine("Results for Dropouts:");
-
+            StringBuilder resultMessage = new StringBuilder();
             foreach (var categoryGrouping in teamResults.GroupBy(result => result.category))
             {
                 resultMessage.AppendLine($"Category {categoryGrouping.Key}");

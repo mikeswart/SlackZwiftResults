@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System.Linq;
 using System.Web;
+using System.Collections.Specialized;
 
 namespace Dropouts.ZwiftResults
 {
@@ -25,19 +26,31 @@ namespace Dropouts.ZwiftResults
 
             log.LogInformation("Request Body:" + requestBody);
 
-            string jsonQueueMessage = string.Empty;
+            NameValueCollection queryString;
             try
             {
-                var queryString = HttpUtility.ParseQueryString(requestBody);
-                jsonQueueMessage = JsonConvert.SerializeObject(
-                    queryString.AllKeys.ToDictionary(
-                        key => key,
-                        key => queryString[key]));
+                queryString = HttpUtility.ParseQueryString(requestBody);
             }
             catch (System.Exception ex)
             {
                 log.LogError($"Error parsing slack request.\nRequest Body: {requestBody}\n Exception: {ex.Message}");
                 return BuildResponse("Oops, something went wrong with the slack framework.");
+            }
+
+            var queryDictionary = queryString.AllKeys.Cast<string>().Where(key => !string.IsNullOrWhiteSpace(key)).ToDictionary(
+                        key => key,
+                        key => queryString[key]);
+            var jsonQueueMessage = JsonConvert.SerializeObject(
+                    queryDictionary);
+
+            string input = queryDictionary["text"];
+            var result = CommandParser.TryParse(input,
+                (CommandNames.Event, _ => {}),
+                (CommandNames.Team, _ => {}));
+
+            if(!result)
+            {
+                return BuildResponse($"Sorry, I don't understand `{input}`. Take a look at the usage hints and try again.");
             }
 
             log.LogInformation("Adding request to the queue");
@@ -62,5 +75,12 @@ namespace Dropouts.ZwiftResults
                 });
             }
         }
+    }
+
+    public static class CommandNames
+    {
+        public const string Team = "team";
+
+        public const string Event = "event";
     }
 }
